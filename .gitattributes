@@ -1,0 +1,6 @@
+# Hashes de aprovação dependem de bytes idênticos em qualquer sistema.
+* text=auto eol=lf
+*.epub binary
+*.jpg binary
+*.jpeg binary
+*.png binary

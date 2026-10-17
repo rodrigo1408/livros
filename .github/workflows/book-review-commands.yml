@@ -1,0 +1,158 @@
+name: book-review-commands
+# Comandos do proprietário nos PRs de livros:
+#   /aprovar <book_id> sha256:<hash>  → registra a aprovação explícita desta versão
+#   /revisar <instruções>             → envia feedback e a fábrica gera nova versão
+#
+# Segurança: roda no contexto da branch base; o conteúdo do PR é tratado como
+# dado; o texto do comentário nunca é interpolado em comandos de shell.
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  statuses: write
+
+concurrency:
+  group: book-review-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  command:
+    if: >-
+      github.event.issue.pull_request &&
+      (startsWith(github.event.comment.body, '/aprovar') || startsWith(github.event.comment.body, '/revisar')) &&
+      github.event.comment.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      BOOK_FACTORY_OWNERS: ${{ vars.BOOK_FACTORY_OWNERS }}
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+      PR: ${{ github.event.issue.number }}
+      COMMENT_ID: ${{ github.event.comment.id }}
+    steps:
+      - name: Script de verificação da branch oficial (confiável)
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+          path: base
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Obter PR e comentário pela API (fonte autenticada)
+        id: ctx
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}" > /tmp/pr.json
+          gh api "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}" > /tmp/comment.json
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          pr = json.load(open("/tmp/pr.json")); c = json.load(open("/tmp/comment.json"))
+          import subprocess, sys
+          open("/tmp/body.txt", "w").write(c.get("body") or "")
+          out = subprocess.run([sys.executable, "base/.github/scripts/book_gate.py", "parse-command",
+                                "--body-file", "/tmp/body.txt"], capture_output=True, text=True).stdout
+          cmd = json.loads(out)
+          same_repo = pr["head"]["repo"]["full_name"] == pr["base"]["repo"]["full_name"]
+          head = pr["head"]["ref"]
+          print(f"command={cmd['command'] or ''}")
+          print(f"same_repo={'true' if same_repo else 'false'}")
+          print(f"head_ref={head}")
+          print(f"head_sha={pr['head']['sha']}")
+          print(f"book_id={head.removeprefix('producao/') if head.startswith('producao/') else ''}")
+          PY
+      - name: Validar contexto
+        env:
+          SAME_REPO: ${{ steps.ctx.outputs.same_repo }}
+          BOOK_ID: ${{ steps.ctx.outputs.book_id }}
+        run: |
+          [ "$SAME_REPO" = true ] || { echo "::error::PRs de forks não são aceitos"; exit 1; }
+          [[ "$BOOK_ID" =~ ^[a-z0-9-]+$ ]] || { echo "::error::PR não é de um livro (branch producao/<id>)"; exit 1; }
+
+      # ------------------------------------------------------------ /aprovar
+      - name: Checkout da branch do PR (para gravar o registro de aprovação)
+        if: steps.ctx.outputs.command == 'aprovar'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ctx.outputs.head_ref }}
+          path: pr
+      - name: Verificar aprovação e gravar registro
+        id: approve
+        if: steps.ctx.outputs.command == 'aprovar'
+        env:
+          BOOK_ID: ${{ steps.ctx.outputs.book_id }}
+          HEAD_SHA: ${{ steps.ctx.outputs.head_sha }}
+          HEAD_REF: ${{ steps.ctx.outputs.head_ref }}
+        working-directory: pr
+        run: |
+          [ "$(git rev-parse HEAD)" = "$HEAD_SHA" ] || { echo "::error::a branch mudou durante a verificação"; exit 1; }
+          set +e
+          python ../base/.github/scripts/book_gate.py verify-approval --book-dir "$BOOK_ID" \
+            --comment-json /tmp/comment.json --pr-json /tmp/pr.json --write > /tmp/approve.json
+          code=$?
+          set -e
+          cat /tmp/approve.json
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" = 0 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add "$BOOK_ID/aprovacao"
+            git commit -q -m "aprovação humana registrada para ${BOOK_ID}" -m "comment=${COMMENT_ID}"
+            git push origin "HEAD:refs/heads/${HEAD_REF}"
+            echo "new_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Executar portão sobre a versão aprovada e publicar status
+        if: steps.approve.outputs.code == '0'
+        env:
+          NEW_SHA: ${{ steps.approve.outputs.new_sha }}
+        run: |
+          # O push feito com GITHUB_TOKEN não dispara workflows; o portão roda aqui.
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files?per_page=100" --jq '.[].filename' > /tmp/changed.txt
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}" > /tmp/pr2.json
+          set +e
+          python base/.github/scripts/book_gate.py gate --repo-root pr --pr-json /tmp/pr2.json \
+            --changed-files /tmp/changed.txt --summary "$GITHUB_STEP_SUMMARY"
+          code=$?
+          set -e
+          if [ "$code" = 0 ]; then state=success; desc="Aprovação humana válida; conteúdo idêntico ao aprovado"
+          else state=failure; desc="Bloqueado pelo portão de aprovação"; fi
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${NEW_SHA}" -f state="$state" \
+            -f context="book-factory/approval-gate" -f description="$desc" \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+      - name: Responder ao /aprovar
+        if: always() && steps.ctx.outputs.command == 'aprovar'
+        env:
+          CODE: ${{ steps.approve.outputs.code }}
+        run: |
+          if [ "$CODE" = 0 ]; then
+            msg="✅ Aprovação registrada em \`aprovacao/aprovacao.json\` (aprovador, data, versão e hash). Marque o PR como pronto e faça o merge manualmente. Qualquer alteração posterior no conteúdo invalida esta aprovação."
+          else
+            errs=$(python -c "import json;print('\n'.join('- '+e for e in json.load(open('/tmp/approve.json')).get('errors',[])))" 2>/dev/null || echo "- verificação não concluída")
+            msg="❌ Aprovação **rejeitada**:
+          ${errs}"
+          fi
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "$msg"
+
+      # ------------------------------------------------------------ /revisar
+      - name: Validar autor do /revisar
+        id: actor
+        if: steps.ctx.outputs.command == 'revisar'
+        run: python base/.github/scripts/book_gate.py verify-actor --comment-json /tmp/comment.json --pr-json /tmp/pr.json
+      - name: Enviar feedback à fábrica
+        if: steps.ctx.outputs.command == 'revisar'
+        env:
+          DISPATCH_TOKEN: ${{ secrets.FACTORY_DISPATCH_TOKEN }}
+          FACTORY_REPO: ${{ vars.FACTORY_REPO }}
+          BOOK_ID: ${{ steps.ctx.outputs.book_id }}
+        run: |
+          [ -n "$DISPATCH_TOKEN" ] && [ -n "$FACTORY_REPO" ] || { echo "::error::FACTORY_DISPATCH_TOKEN/FACTORY_REPO não configurados"; exit 1; }
+          issue=$(gh api "repos/${GITHUB_REPOSITORY}/contents/${BOOK_ID}/.factory/state.json?ref=producao/${BOOK_ID}" --jq .content \
+            | base64 -d | python -c "import json,sys;print(json.load(sys.stdin)['request'].get('issue_number') or '')")
+          GH_TOKEN="$DISPATCH_TOKEN" gh api "repos/${FACTORY_REPO}/dispatches" -f event_type=book-feedback \
+            -f "client_payload[book_id]=${BOOK_ID}" -f "client_payload[pr_number]=${PR}" \
+            -f "client_payload[comment_id]=${COMMENT_ID}" -f "client_payload[issue_number]=${issue}"
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "📝 Feedback recebido e enviado à fábrica. Uma nova versão será publicada neste PR para nova revisão."

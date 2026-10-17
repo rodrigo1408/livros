@@ -1,0 +1,8 @@
+# Arquivos temporários e de bloqueio da fábrica (nunca versionados)
+**/.factory/lock.json
+*.tmp
+*.tmp[0-9]*
+*.epub.tmp
+.DS_Store
+Thumbs.db
+__pycache__/
